@@ -10,7 +10,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -80,6 +80,21 @@ async def async_setup_entry(
         if reg_entry.domain == "sensor" and reg_entry.unique_id not in expected_unique_ids:
             log.info("Removing stale sensor entity: %s", reg_entry.entity_id)
             ent_reg.async_remove(reg_entry.entity_id)
+
+    # Remove stale devices from the device registry
+    expected_device_ids = set()
+    for meter_config in meters:
+        slug = _make_slug(meter_config[CONF_METER_NAME])
+        expected_device_ids.add((DOMAIN, f"water_meter_{slug}"))
+    for vm_config in virtual_meters:
+        slug = _make_slug(vm_config[CONF_METER_NAME])
+        expected_device_ids.add((DOMAIN, f"water_meter_{slug}"))
+
+    dev_reg = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+        if not device.identifiers & expected_device_ids:
+            log.info("Removing stale device: %s", device.name)
+            dev_reg.async_remove_device(device.id)
 
     async_add_entities(entities)
 
