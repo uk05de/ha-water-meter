@@ -11,10 +11,12 @@
     "step": {
       "init": {
         "title": "Wasserzähler verwalten",
-        "description": "Aktuell {count} Zähler konfiguriert.",
+        "description": "Aktuell {count} Zähler und {virtual_count} virtuelle Zähler konfiguriert.",
         "menu_options": {
           "add_meter": "Zähler hinzufügen",
-          "remove_meter": "Zähler entfernen"
+          "remove_meter": "Zähler entfernen",
+          "add_virtual_meter": "Virtuellen Zähler hinzufügen",
+          "remove_virtual_meter": "Virtuellen Zähler entfernen"
         }
       },
       "add_meter": {
@@ -31,7 +33,27 @@
         "data": {
           "meter": "Zähler auswählen"
         }
+      },
+      "add_virtual_meter": {
+        "title": "Virtuellen Zähler hinzufügen",
+        "description": "Berechnet: Basiszähler minus Abzugszähler.",
+        "data": {
+          "name": "Name (z.B. Hauswasser)",
+          "base_meter": "Basiszähler",
+          "subtract_meters": "Abzugszähler"
+        }
+      },
+      "remove_virtual_meter": {
+        "title": "Virtuellen Zähler entfernen",
+        "data": {
+          "meter": "Virtuellen Zähler auswählen"
+        }
       }
+    },
+    "error": {
+      "meter_in_use": "Dieser Zähler wird von einem virtuellen Zähler referenziert. Bitte zuerst den virtuellen Zähler entfernen.",
+      "base_in_subtract": "Der Basiszähler darf nicht gleichzeitig als Abzugszähler gewählt werden.",
+      "no_subtract_meters": "Mindestens ein Abzugszähler muss ausgewählt werden."
     }
   }
 }

@@ -6,6 +6,7 @@ from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -17,6 +18,18 @@ from .const import (
 log = logging.getLogger(__name__)
 
 
+def _make_slug(name: str) -> str:
+    """Generate slug from meter name."""
+    return (
+        name.lower()
+        .replace(" ", "_")
+        .replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("ß", "ss")
+    )
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -25,11 +38,20 @@ async def async_setup_entry(
     """Set up water meter number entities for manual correction."""
     meters = entry.options.get(CONF_METERS, [])
 
-    # We need to find the sensor entities to link to
-    # They will be available after sensor platform setup
     entities = []
+    expected_unique_ids = set()
+
     for meter_config in meters:
-        entities.append(WaterMeterCorrection(meter_config, entry.entry_id))
+        entity = WaterMeterCorrection(meter_config, entry.entry_id)
+        entities.append(entity)
+        expected_unique_ids.add(entity.unique_id)
+
+    # Remove stale number entities from the entity registry
+    ent_reg = er.async_get(hass)
+    for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+        if reg_entry.domain == "number" and reg_entry.unique_id not in expected_unique_ids:
+            log.info("Removing stale number entity: %s", reg_entry.entity_id)
+            ent_reg.async_remove(reg_entry.entity_id)
 
     async_add_entities(entities)
 
@@ -48,7 +70,7 @@ class WaterMeterCorrection(NumberEntity):
 
     def __init__(self, config: dict, entry_id: str):
         self._meter_name = config[CONF_METER_NAME]
-        slug = self._meter_name.lower().replace(" ", "_").replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+        slug = _make_slug(self._meter_name)
         self._slug = slug
         self._attr_unique_id = f"water_meter_{slug}_correction"
         self._attr_device_info = {
@@ -83,13 +105,6 @@ class WaterMeterCorrection(NumberEntity):
         """Set new counter value — find and update the counter sensor."""
         new_value = int(value)
         self._value = new_value
-
-        # Find the counter sensor entity and update it
-        entity_registry = self.hass.data.get("entity_registry")
-        for entry_data in self.hass.data.get(DOMAIN, {}).values():
-            # The sensor platform stores entities in HA's entity registry
-            # We need to find the WaterMeterCounter by slug
-            pass
 
         # Use a more direct approach — fire an event that the sensor listens to
         self.hass.bus.async_fire(

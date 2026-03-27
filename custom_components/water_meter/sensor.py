@@ -10,6 +10,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -21,9 +22,24 @@ from .const import (
     CONF_IMPULSE_ENTITY,
     CONF_INITIAL_VALUE,
     CONF_LITERS_PER_IMPULSE,
+    CONF_VIRTUAL_METERS,
+    CONF_BASE_METER,
+    CONF_SUBTRACT_METERS,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _make_slug(name: str) -> str:
+    """Generate slug from meter name."""
+    return (
+        name.lower()
+        .replace(" ", "_")
+        .replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("ß", "ss")
+    )
 
 
 async def async_setup_entry(
@@ -33,12 +49,37 @@ async def async_setup_entry(
 ) -> None:
     """Set up water meter sensors from a config entry."""
     meters = entry.options.get(CONF_METERS, [])
+    virtual_meters = entry.options.get(CONF_VIRTUAL_METERS, [])
 
     entities = []
+    expected_unique_ids = set()
+
+    # Physical meters
     for meter_config in meters:
         counter = WaterMeterCounter(hass, meter_config, entry.entry_id)
         entities.append(counter)
-        entities.append(WaterMeterCubic(counter))
+        expected_unique_ids.add(counter.unique_id)
+
+        cubic = WaterMeterCubic(counter)
+        entities.append(cubic)
+        expected_unique_ids.add(cubic.unique_id)
+
+    # Virtual meters
+    for vm_config in virtual_meters:
+        vcounter = WaterMeterVirtualCounter(hass, vm_config, entry.entry_id)
+        entities.append(vcounter)
+        expected_unique_ids.add(vcounter.unique_id)
+
+        vcubic = WaterMeterVirtualCubic(vcounter)
+        entities.append(vcubic)
+        expected_unique_ids.add(vcubic.unique_id)
+
+    # Remove stale sensor entities from the entity registry
+    ent_reg = er.async_get(hass)
+    for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+        if reg_entry.domain == "sensor" and reg_entry.unique_id not in expected_unique_ids:
+            log.info("Removing stale sensor entity: %s", reg_entry.entity_id)
+            ent_reg.async_remove(reg_entry.entity_id)
 
     async_add_entities(entities)
 
@@ -61,7 +102,7 @@ class WaterMeterCounter(SensorEntity, RestoreEntity):
         self._total_liters = 0
         self._unsub = None
 
-        slug = self._meter_name.lower().replace(" ", "_").replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+        slug = _make_slug(self._meter_name)
         self.slug = slug
         self._attr_unique_id = f"water_meter_{slug}_liters"
         self._attr_device_info = {
@@ -151,6 +192,186 @@ class WaterMeterCubic(SensorEntity):
     _attr_icon = "mdi:water-pump"
 
     def __init__(self, counter: WaterMeterCounter):
+        self._counter = counter
+        self._attr_unique_id = f"water_meter_{counter.slug}_m3"
+        self._attr_device_info = counter._attr_device_info
+
+    @property
+    def name(self) -> str:
+        return f"{self._counter._meter_name} (m³)"
+
+    @property
+    def native_value(self) -> float:
+        return round(self._counter._total_liters / 1000, 3)
+
+    @property
+    def should_poll(self) -> bool:
+        return False
+
+    @callback
+    def async_write_ha_state(self) -> None:
+        """Update when counter updates."""
+        super().async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Track counter updates."""
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass,
+                [self._counter.entity_id],
+                lambda event: self.async_write_ha_state(),
+            )
+        )
+
+
+class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
+    """Virtual water meter — calculates base minus subtractors using delta tracking."""
+
+    _attr_device_class = SensorDeviceClass.WATER
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfVolume.LITERS
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:water-pump"
+
+    def __init__(self, hass: HomeAssistant, config: dict, entry_id: str):
+        self._hass = hass
+        self._meter_name = config[CONF_METER_NAME]
+        self._base_slug = config[CONF_BASE_METER]
+        self._subtract_slugs = config.get(CONF_SUBTRACT_METERS, [])
+        self._total_liters = 0
+        self._unsubs = []
+
+        # Map source entity_id → last seen liter value (None = not yet seen)
+        self._last_seen: dict[str, int | None] = {}
+        # Map source entity_id → "base" or "subtract"
+        self._source_roles: dict[str, str] = {}
+
+        slug = _make_slug(self._meter_name)
+        self.slug = slug
+        self._attr_unique_id = f"water_meter_{slug}_liters"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, f"water_meter_{slug}")},
+            "name": f"Wasserzähler {self._meter_name}",
+            "manufacturer": "Water Meter",
+            "model": "Berechneter Zähler",
+        }
+
+    @property
+    def name(self) -> str:
+        return f"{self._meter_name} (L)"
+
+    @property
+    def native_value(self) -> int:
+        return self._total_liters
+
+    def _find_entity_id_for_slug(self, slug: str) -> str | None:
+        """Find the entity_id of a physical counter sensor by its slug."""
+        target_suffix = f"{slug}_liters"
+        for state in self._hass.states.async_all("sensor"):
+            if state.entity_id.endswith(target_suffix):
+                return state.entity_id
+        return None
+
+    async def async_added_to_hass(self) -> None:
+        """Restore state and start listening to source meters."""
+        await super().async_added_to_hass()
+
+        # Restore previous value
+        last_state = await self.async_get_last_state()
+        if last_state is not None and last_state.state not in ("unknown", "unavailable"):
+            self._total_liters = int(float(last_state.state))
+            log.info("Restored virtual %s: %d L", self._meter_name, self._total_liters)
+
+        # Find source entity IDs and set up tracking
+        all_source_entities = []
+
+        base_entity_id = self._find_entity_id_for_slug(self._base_slug)
+        if base_entity_id:
+            self._source_roles[base_entity_id] = "base"
+            self._last_seen[base_entity_id] = None
+            all_source_entities.append(base_entity_id)
+            log.info("Virtual %s: base → %s", self._meter_name, base_entity_id)
+        else:
+            log.warning("Virtual %s: base meter '%s' not found", self._meter_name, self._base_slug)
+
+        for sub_slug in self._subtract_slugs:
+            sub_entity_id = self._find_entity_id_for_slug(sub_slug)
+            if sub_entity_id:
+                self._source_roles[sub_entity_id] = "subtract"
+                self._last_seen[sub_entity_id] = None
+                all_source_entities.append(sub_entity_id)
+                log.info("Virtual %s: subtract → %s", self._meter_name, sub_entity_id)
+            else:
+                log.warning("Virtual %s: subtract meter '%s' not found", self._meter_name, sub_slug)
+
+        if all_source_entities:
+            unsub = async_track_state_change_event(
+                self._hass,
+                all_source_entities,
+                self._handle_source_change,
+            )
+            self._unsubs.append(unsub)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop listening."""
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs.clear()
+
+    @callback
+    def _handle_source_change(self, event) -> None:
+        """Handle state change of a source meter — apply delta."""
+        new_state = event.data.get("new_state")
+        if new_state is None or new_state.state in ("unknown", "unavailable"):
+            return
+
+        entity_id = event.data.get("entity_id")
+        if entity_id not in self._source_roles:
+            return
+
+        try:
+            new_value = int(float(new_state.state))
+        except (ValueError, TypeError):
+            return
+
+        last = self._last_seen.get(entity_id)
+
+        if last is None:
+            # First time seeing this source after restart — just record baseline
+            self._last_seen[entity_id] = new_value
+            log.debug("Virtual %s: baseline %s = %d L", self._meter_name, entity_id, new_value)
+            return
+
+        delta = new_value - last
+        self._last_seen[entity_id] = new_value
+
+        if delta == 0:
+            return
+
+        role = self._source_roles[entity_id]
+        if role == "base":
+            self._total_liters += delta
+        else:
+            self._total_liters -= delta
+
+        self._total_liters = max(0, self._total_liters)
+        self.async_write_ha_state()
+        log.debug(
+            "Virtual %s: %s %s delta=%+d → %d L",
+            self._meter_name, role, entity_id, delta, self._total_liters,
+        )
+
+
+class WaterMeterVirtualCubic(SensorEntity):
+    """Virtual water meter in cubic meters — derived from virtual liter counter."""
+
+    _attr_device_class = SensorDeviceClass.WATER
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:water-pump"
+
+    def __init__(self, counter: WaterMeterVirtualCounter):
         self._counter = counter
         self._attr_unique_id = f"water_meter_{counter.slug}_m3"
         self._attr_device_info = counter._attr_device_info
