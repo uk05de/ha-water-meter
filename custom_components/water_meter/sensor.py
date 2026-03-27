@@ -223,18 +223,17 @@ class WaterMeterCubic(SensorEntity):
     def should_poll(self) -> bool:
         return False
 
-    @callback
-    def async_write_ha_state(self) -> None:
-        """Update when counter updates."""
-        super().async_write_ha_state()
-
     async def async_added_to_hass(self) -> None:
         """Track counter updates."""
+        @callback
+        def _update(event) -> None:
+            self.async_write_ha_state()
+
         self.async_on_remove(
             async_track_state_change_event(
                 self.hass,
                 [self._counter.entity_id],
-                lambda event: self.async_write_ha_state(),
+                _update,
             )
         )
 
@@ -281,11 +280,9 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
 
     def _find_entity_id_for_slug(self, slug: str) -> str | None:
         """Find the entity_id of a physical counter sensor by its slug."""
-        target_suffix = f"{slug}_liters"
-        for state in self._hass.states.async_all("sensor"):
-            if state.entity_id.endswith(target_suffix):
-                return state.entity_id
-        return None
+        target_unique_id = f"water_meter_{slug}_liters"
+        ent_reg = er.async_get(self._hass)
+        return ent_reg.async_get_entity_id("sensor", DOMAIN, target_unique_id)
 
     async def async_added_to_hass(self) -> None:
         """Restore state and start listening to source meters."""
@@ -403,17 +400,16 @@ class WaterMeterVirtualCubic(SensorEntity):
     def should_poll(self) -> bool:
         return False
 
-    @callback
-    def async_write_ha_state(self) -> None:
-        """Update when counter updates."""
-        super().async_write_ha_state()
-
     async def async_added_to_hass(self) -> None:
         """Track counter updates."""
+        @callback
+        def _update(event) -> None:
+            self.async_write_ha_state()
+
         self.async_on_remove(
             async_track_state_change_event(
                 self.hass,
                 [self._counter.entity_id],
-                lambda event: self.async_write_ha_state(),
+                _update,
             )
         )

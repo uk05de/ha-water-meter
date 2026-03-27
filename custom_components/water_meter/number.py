@@ -4,7 +4,7 @@ import logging
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfVolume
+from homeassistant.const import EntityCategory, UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -65,7 +65,7 @@ class WaterMeterCorrection(NumberEntity):
     _attr_mode = NumberMode.BOX
     _attr_native_unit_of_measurement = UnitOfVolume.LITERS
     _attr_icon = "mdi:water-sync"
-    _attr_entity_category = "config"
+    _attr_entity_category = EntityCategory.CONFIG
     _attr_has_entity_name = True
 
     def __init__(self, config: dict, entry_id: str):
