@@ -1,0 +1,37 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Wasserzähler",
+        "description": "Wasserzähler-Integration einrichten. Nach der Einrichtung können Zähler über 'Konfigurieren' hinzugefügt werden."
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Wasserzähler verwalten",
+        "description": "Aktuell {count} Zähler konfiguriert.",
+        "menu_options": {
+          "add_meter": "Zähler hinzufügen",
+          "remove_meter": "Zähler entfernen"
+        }
+      },
+      "add_meter": {
+        "title": "Wasserzähler hinzufügen",
+        "data": {
+          "name": "Name (z.B. Hauptwasser, Garten)",
+          "impulse_entity": "Impuls-Sensor (Binary Sensor)",
+          "initial_value": "Aktueller Zählerstand (Liter)",
+          "liters_per_impulse": "Liter pro Impuls"
+        }
+      },
+      "remove_meter": {
+        "title": "Wasserzähler entfernen",
+        "data": {
+          "meter": "Zähler auswählen"
+        }
+      }
+    }
+  }
+}
