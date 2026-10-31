@@ -26,8 +26,11 @@ from .const import (
     CONF_BASE_METER,
     CONF_SUBTRACT_METERS,
 )
+from .virtual_delta import ROLE_BASE, ROLE_SUBTRACT, apply_delta
 
 log = logging.getLogger(__name__)
+
+ATTR_DEFICIT_LITERS = "deficit_liters"
 
 
 def _make_slug(name: str) -> str:
@@ -253,6 +256,8 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
         self._base_slug = config[CONF_BASE_METER]
         self._subtract_slugs = config.get(CONF_SUBTRACT_METERS, [])
         self._total_liters = 0
+        # Liters subtracted but not yet offset against base increments
+        self._deficit_liters = 0
         self._unsubs = []
 
         # Map source entity_id → last seen liter value (None = not yet seen)
@@ -278,6 +283,10 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
     def native_value(self) -> int:
         return self._total_liters
 
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {ATTR_DEFICIT_LITERS: self._deficit_liters}
+
     def _find_entity_id_for_slug(self, slug: str) -> str | None:
         """Find the entity_id of a physical counter sensor by its slug."""
         target_unique_id = f"water_meter_{slug}_liters"
@@ -293,13 +302,24 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
         if last_state is not None and last_state.state not in ("unknown", "unavailable"):
             self._total_liters = int(float(last_state.state))
             log.info("Restored virtual %s: %d L", self._meter_name, self._total_liters)
+        if last_state is not None:
+            try:
+                self._deficit_liters = max(
+                    0, int(float(last_state.attributes.get(ATTR_DEFICIT_LITERS, 0)))
+                )
+            except (ValueError, TypeError):
+                self._deficit_liters = 0
+            if self._deficit_liters:
+                log.info(
+                    "Restored virtual %s: deficit %d L", self._meter_name, self._deficit_liters
+                )
 
         # Find source entity IDs and set up tracking
         all_source_entities = []
 
         base_entity_id = self._find_entity_id_for_slug(self._base_slug)
         if base_entity_id:
-            self._source_roles[base_entity_id] = "base"
+            self._source_roles[base_entity_id] = ROLE_BASE
             self._last_seen[base_entity_id] = None
             all_source_entities.append(base_entity_id)
             log.info("Virtual %s: base → %s", self._meter_name, base_entity_id)
@@ -309,7 +329,7 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
         for sub_slug in self._subtract_slugs:
             sub_entity_id = self._find_entity_id_for_slug(sub_slug)
             if sub_entity_id:
-                self._source_roles[sub_entity_id] = "subtract"
+                self._source_roles[sub_entity_id] = ROLE_SUBTRACT
                 self._last_seen[sub_entity_id] = None
                 all_source_entities.append(sub_entity_id)
                 log.info("Virtual %s: subtract → %s", self._meter_name, sub_entity_id)
@@ -361,17 +381,26 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
             return
 
         role = self._source_roles[entity_id]
-        if role == "base":
-            self._total_liters += delta
-        else:
-            self._total_liters -= delta
-
-        self._total_liters = max(0, self._total_liters)
+        old_deficit = self._deficit_liters
+        self._total_liters, self._deficit_liters = apply_delta(
+            self._total_liters, self._deficit_liters, role, delta
+        )
         self.async_write_ha_state()
         log.debug(
             "Virtual %s: %s %s delta=%+d → %d L",
             self._meter_name, role, entity_id, delta, self._total_liters,
         )
+        if self._deficit_liters > old_deficit:
+            log.debug(
+                "Virtual %s: deficit grows by %d L to %d L (total held at %d L)",
+                self._meter_name, self._deficit_liters - old_deficit,
+                self._deficit_liters, self._total_liters,
+            )
+        elif self._deficit_liters < old_deficit:
+            log.debug(
+                "Virtual %s: deficit paid off by %d L, %d L remaining",
+                self._meter_name, old_deficit - self._deficit_liters, self._deficit_liters,
+            )
 
 
 class WaterMeterVirtualCubic(SensorEntity):

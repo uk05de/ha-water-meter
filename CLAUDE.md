@@ -27,6 +27,8 @@
 - custom_components/water_meter/config_flow.py — Config flow + options flow (add/remove meters + virtual meters)
 - custom_components/water_meter/sensor.py — Counter sensor (L) + cubic meter sensor (m³), impulse listener, virtual meters
 - custom_components/water_meter/number.py — Manual correction number entity
+- custom_components/water_meter/virtual_delta.py — Pure delta/deficit logic for virtual meters (no HA imports)
+- tests/test_virtual_delta.py — Standalone tests (no HA install needed)
 - custom_components/water_meter/const.py — Constants
 - custom_components/water_meter/strings.json — German UI strings
 - custom_components/water_meter/manifest.json — Integration metadata (version here!)
@@ -51,9 +53,18 @@
 ## Virtual Meter — Delta-Based Tracking
 - Owns its own _total_liters, persisted via RestoreEntity
 - On restart: restores last value, records current source values as baseline (no delta)
-- On source change: computes delta from last seen value, applies +/- to own counter
+- On source change: computes delta from last seen value, applies it via apply_delta() (virtual_delta.py)
+- The total NEVER decreases: a subtraction (or a base meter corrected down) is booked as
+  deficit instead of lowering the total. Later increases first pay off the deficit, only the
+  remainder is added. total - deficit always equals the net balance.
+- Why: the garden meter can count before/without the main meter (e.g. missed impulses on the
+  main Shelly). Subtracting immediately lowered Hauswasser (2026-04-30: -231 L), which
+  corrupted the long-term statistics sum of the total_increasing sensor.
+- Deficit is exposed as state attribute deficit_liters and restored on restart (RestoreEntity)
+- Debug log when the deficit grows or is paid off
 - Prevents jumps/peaks/resets on HA restart
-- state_class: total_increasing is correct (value never decreases in normal operation)
+- state_class: total_increasing is correct (value never decreases)
+- virtual_delta.py has no HA imports; tests (from repo root): python3 -m unittest discover tests
 
 ## Known Limitation
 - Impulses during HA downtime are lost (Shelly sends ON/OFF, but HA isn't listening)
