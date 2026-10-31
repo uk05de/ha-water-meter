@@ -12,8 +12,9 @@ from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_state_change_event
-from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -26,11 +27,21 @@ from .const import (
     CONF_BASE_METER,
     CONF_SUBTRACT_METERS,
 )
-from .virtual_delta import ROLE_BASE, ROLE_SUBTRACT, apply_delta
+from .virtual_delta import ROLE_BASE, ROLE_SUBTRACT, VirtualMeterState
 
 log = logging.getLogger(__name__)
 
 ATTR_DEFICIT_LITERS = "deficit_liters"
+
+
+class VirtualMeterExtraData(ExtraStoredData):
+    """Restore-only data of a virtual meter (kept out of the recorder)."""
+
+    def __init__(self, last_subtract_at: float | None):
+        self.last_subtract_at = last_subtract_at
+
+    def as_dict(self) -> dict:
+        return {"last_subtract_at": self.last_subtract_at}
 
 
 def _make_slug(name: str) -> str:
@@ -255,10 +266,10 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
         self._meter_name = config[CONF_METER_NAME]
         self._base_slug = config[CONF_BASE_METER]
         self._subtract_slugs = config.get(CONF_SUBTRACT_METERS, [])
-        self._total_liters = 0
-        # Liters subtracted but not yet offset against base increments
-        self._deficit_liters = 0
+        # Total, deficit (subtracted liters not yet offset) and last subtract activity
+        self._meter_state = VirtualMeterState()
         self._unsubs = []
+        self._unsub_expiry = None
 
         # Map source entity_id → last seen liter value (None = not yet seen)
         self._last_seen: dict[str, int | None] = {}
@@ -281,11 +292,15 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
 
     @property
     def native_value(self) -> int:
-        return self._total_liters
+        return self._meter_state.total
 
     @property
     def extra_state_attributes(self) -> dict:
-        return {ATTR_DEFICIT_LITERS: self._deficit_liters}
+        return {ATTR_DEFICIT_LITERS: self._meter_state.deficit}
+
+    @property
+    def extra_restore_state_data(self) -> VirtualMeterExtraData:
+        return VirtualMeterExtraData(self._meter_state.last_subtract_at)
 
     def _find_entity_id_for_slug(self, slug: str) -> str | None:
         """Find the entity_id of a physical counter sensor by its slug."""
@@ -300,19 +315,26 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
         # Restore previous value
         last_state = await self.async_get_last_state()
         if last_state is not None and last_state.state not in ("unknown", "unavailable"):
-            self._total_liters = int(float(last_state.state))
-            log.info("Restored virtual %s: %d L", self._meter_name, self._total_liters)
+            self._meter_state.total = int(float(last_state.state))
+            log.info("Restored virtual %s: %d L", self._meter_name, self._meter_state.total)
         if last_state is not None:
             try:
-                self._deficit_liters = max(
+                self._meter_state.deficit = max(
                     0, int(float(last_state.attributes.get(ATTR_DEFICIT_LITERS, 0)))
                 )
             except (ValueError, TypeError):
-                self._deficit_liters = 0
-            if self._deficit_liters:
-                log.info(
-                    "Restored virtual %s: deficit %d L", self._meter_name, self._deficit_liters
-                )
+                self._meter_state.deficit = 0
+        last_extra = await self.async_get_last_extra_data()
+        if last_extra is not None:
+            last_subtract_at = last_extra.as_dict().get("last_subtract_at")
+            if isinstance(last_subtract_at, (int, float)):
+                self._meter_state.last_subtract_at = float(last_subtract_at)
+        if self._meter_state.deficit:
+            log.info("Restored virtual %s: deficit %d L", self._meter_name, self._meter_state.deficit)
+        # Drop a deficit whose subtract meters went idle (or that has no timestamp)
+        now = dt_util.utcnow()
+        self._log_dropped(self._meter_state.expire(now.timestamp()))
+        self._schedule_deficit_expiry(now)
 
         # Find source entity IDs and set up tracking
         all_source_entities = []
@@ -349,6 +371,35 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
+        if self._unsub_expiry:
+            self._unsub_expiry()
+            self._unsub_expiry = None
+
+    def _log_dropped(self, dropped: int) -> None:
+        if dropped:
+            log.debug(
+                "Virtual %s: subtract meters idle, dropped deficit of %d L (total %d L)",
+                self._meter_name, dropped, self._meter_state.total,
+            )
+
+    def _schedule_deficit_expiry(self, now) -> None:
+        """Arm a timer for when the current deficit would expire."""
+        expires_at = self._meter_state.expires_at()
+        if expires_at is None or self._unsub_expiry is not None:
+            return
+        self._unsub_expiry = async_call_later(
+            self._hass, max(0, expires_at - now.timestamp()), self._check_deficit_expiry
+        )
+
+    @callback
+    def _check_deficit_expiry(self, now) -> None:
+        """Drop the deficit if expired, else re-arm (subtract meters still active)."""
+        self._unsub_expiry = None
+        dropped = self._meter_state.expire(now.timestamp())
+        if dropped:
+            self._log_dropped(dropped)
+            self.async_write_ha_state()
+        self._schedule_deficit_expiry(now)
 
     @callback
     def _handle_source_change(self, event) -> None:
@@ -381,26 +432,27 @@ class WaterMeterVirtualCounter(SensorEntity, RestoreEntity):
             return
 
         role = self._source_roles[entity_id]
-        old_deficit = self._deficit_liters
-        self._total_liters, self._deficit_liters = apply_delta(
-            self._total_liters, self._deficit_liters, role, delta
-        )
+        now = dt_util.utcnow()
+        self._log_dropped(self._meter_state.expire(now.timestamp()))
+        old_deficit = self._meter_state.deficit
+        self._meter_state.apply(role, delta, now.timestamp())
         self.async_write_ha_state()
         log.debug(
             "Virtual %s: %s %s delta=%+d → %d L",
-            self._meter_name, role, entity_id, delta, self._total_liters,
+            self._meter_name, role, entity_id, delta, self._meter_state.total,
         )
-        if self._deficit_liters > old_deficit:
+        if self._meter_state.deficit > old_deficit:
             log.debug(
                 "Virtual %s: deficit grows by %d L to %d L (total held at %d L)",
-                self._meter_name, self._deficit_liters - old_deficit,
-                self._deficit_liters, self._total_liters,
+                self._meter_name, self._meter_state.deficit - old_deficit,
+                self._meter_state.deficit, self._meter_state.total,
             )
-        elif self._deficit_liters < old_deficit:
+        elif self._meter_state.deficit < old_deficit:
             log.debug(
                 "Virtual %s: deficit paid off by %d L, %d L remaining",
-                self._meter_name, old_deficit - self._deficit_liters, self._deficit_liters,
+                self._meter_name, old_deficit - self._meter_state.deficit, self._meter_state.deficit,
             )
+        self._schedule_deficit_expiry(now)
 
 
 class WaterMeterVirtualCubic(SensorEntity):
@@ -423,7 +475,7 @@ class WaterMeterVirtualCubic(SensorEntity):
 
     @property
     def native_value(self) -> float:
-        return round(self._counter._total_liters / 1000, 3)
+        return round(self._counter.native_value / 1000, 3)
 
     @property
     def should_poll(self) -> bool:

@@ -60,8 +60,25 @@
 - Why: the garden meter can count before/without the main meter (e.g. missed impulses on the
   main Shelly). Subtracting immediately lowered Hauswasser (2026-04-30: -231 L), which
   corrupted the long-term statistics sum of the total_increasing sensor.
-- Deficit is exposed as state attribute deficit_liters and restored on restart (RestoreEntity)
-- Debug log when the deficit grows or is paid off
+- Deficit EXPIRES once all subtract meters have been idle for DEFICIT_EXPIRY_SECONDS (600 s,
+  constant in virtual_delta.py, no UI option). The deficit only bridges impulse-order jitter for
+  the same liter. What remains after irrigation is meter deviation: the garden meter (optical)
+  counts ~4–5 % more than the main meter (reed) at 600–1200 L/h; the main meter is the
+  billing reference. Without expiry that overhang (~1.5 m³/season) would later be taken off
+  real house water. No phantom impulses or main-meter dropouts were found (hourly comparison
+  since 2026-03).
+- Trade-offs: house water used within 10 min after irrigation still pays off the overhang;
+  if the main impulse arrives before the garden impulse for the last liters, up to that lead
+  (~1–2 L) stays counted as house water. A base meter corrected down only reduces the virtual
+  meter while subtract meters are active (otherwise its deficit expires).
+- State lives in VirtualMeterState (virtual_delta.py): total, deficit, last_subtract_at
+  (UTC epoch s). Expiry is checked lazily before each delta and by an async_call_later timer
+  armed for expires_at() (re-armed while the garden is still running).
+- Deficit is exposed as state attribute deficit_liters (restored from it on restart).
+  last_subtract_at is kept out of the recorder (changes every garden liter) and persisted via
+  extra_restore_state_data (VirtualMeterExtraData). On restart a deficit expires normally from
+  the restored timestamp; a deficit without timestamp (from v0.2.1) is dropped.
+- Debug log when the deficit grows, is paid off, or is dropped
 - Prevents jumps/peaks/resets on HA restart
 - state_class: total_increasing is correct (value never decreases)
 - virtual_delta.py has no HA imports; tests (from repo root): python3 -m unittest discover tests
